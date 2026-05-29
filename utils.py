@@ -1,0 +1,793 @@
+import time
+import sys
+import random
+import io
+import re
+import cv2
+import numpy as np
+import ddddocr
+import subprocess
+import ssl
+import urllib.request
+import traceback
+import uiautomator2 as u2
+
+# 正确的SSL禁用方式：赋值为「调用后的上下文对象」，而非函数本身
+original_context = ssl._create_default_https_context
+ssl._create_default_https_context = ssl._create_unverified_context()  # 关键：加()调用函数
+
+# 额外配置urllib的opener，双重确保跳过SSL验证
+opener = urllib.request.build_opener(
+    urllib.request.HTTPSHandler(context=ssl._create_unverified_context())
+)
+urllib.request.install_opener(opener)
+
+from PIL import Image
+
+TB_APP = "com.taobao.taobao"
+ALIPAY_APP = "com.eg.android.AlipayGphone"
+FISH_APP = "com.taobao.idlefish"
+TMALL_APP = "com.tmall.wireless"
+TMALL_HOME = "com.tmall.wireless.maintab.module.TMMainTabActivity"
+
+# 应用启动配置，键为包名，值为activity
+APP_START_CONFIG = {
+    TB_APP: "com.taobao.tao.welcome.Welcome",
+    FISH_APP: "com.taobao.fleamarket.home.activity.InitActivity",
+    TMALL_APP: "com.tmall.wireless.maintab.module.TMMainTabActivity",
+    ALIPAY_APP: "com.eg.android.AlipayGphone.AlipayLogin"  # 默认配置，不指定activity
+}
+VIDEO_ACTIVITY = ["com.taobao.idlefish.ads.csj.TTAdStandardPortraitActivity"]
+
+
+COIN_TASK_PRIORITY_RULES = [
+    ("签到类", 10, ["签到", "连续签到", "领今日金币", "领取今日奖励"]),
+    ("领取类", 20, ["领取奖励", "开宝箱", "宝箱"]),
+    ("浏览商品", 30, ["发现精选好物", "看严选推荐商品", "浏览商品", "浏览好物", "逛精选", "逛爆款", "看看#", "看精选", "好物沉浸看", "金币抵钱好货"]),
+    ("搜索浏览", 35, ["搜一搜你", "搜索你喜欢", "搜索你心仪", "搜心仪商品"]),
+    ("浏览店铺", 40, ["逛店铺", "浏览好店", "进店逛逛", "逛品牌店", "好店"]),
+    ("活动会场", 50, ["618", "双11", "双12", "会场", "活动页"]),
+    ("金币庄园", 60, ["金币庄园", "金币农场", "种金币", "收金币"]),
+    ("内容浏览", 70, ["短视频", "看视频", "看直播", "直播间"]),
+    ("小游戏", 80, ["试玩", "小游戏"]),
+    ("答题类", 45, ["淘金币趣味课堂", "百科问答"]),
+    ("外部应用", 90, ["蚂蚁庄园", "闲鱼币"]),
+]
+
+COIN_TASK_SKIP_RULES = [
+    ("付费/下单", ["下单", "付款", "充值", "购买", "0.01元", "0.01 元"]),
+    ("开通/授权", ["开通", "授权", "银行卡"]),
+    ("社交成本", ["邀请好友", "助力", "分享"]),
+    ("污染列表", ["关注", "收藏", "加购"]),
+    ("不确定收益", ["抽奖"]),
+]
+
+COIN_TASK_SPECIAL_SKIP_RULES = [
+    ("付费/下单", ["搜索兴趣商品下单", "买限时折扣好物得奖励", "下单即得"]),
+    ("高副作用", ["点击商品领优惠红包", "发评价得金币"]),
+    ("营销/转化", ["充话费", "抽免单卡"]),
+]
+
+COIN_TASK_SPECIAL_DO_RULES = [
+    ("活动浏览", 55, ["来淘宝闪购分百亿补贴"]),
+]
+
+DEFAULT_SKIP_CHARS = [
+    "拉好友",
+    "抢红包",
+    "搜索兴趣商品下单",
+    "买精选商品",
+    "全场3元3件",
+    "固定入口",
+    "砸蛋",
+    "大众点评",
+    "蚂蚁新村",
+    "消消乐",
+    "3元抢3件包邮到家",
+    "拍一拍",
+    "1元抢爆款好货",
+    "拉1人助力",
+    "玩消消乐",
+    "下单即得",
+    "添加签到神器",
+    "下单得肥料",
+    "88VIP",
+    "邀请好友",
+    "好货限时直降",
+    "连连消",
+    "拍立淘",
+    "首页回访",
+    "百亿外卖",
+    "玩趣味游戏得大额体力",
+    "天猫积分换体力",
+    "头条刷热点",
+    "一淘签到",
+    "每拉",
+    "闪购拿大额补贴",
+    "开心消消乐过1关",
+    "通关",
+    "购买商品",
+    "去闪购领红包点外卖",
+    "冒险大作战",
+    "斗地主",
+    "买限时折扣好物",
+    "趣头条",
+    "(1000/3500)",
+    "任意下单",
+    "农场对对碰匹配",
+    "任意充值",
+    "闯关",
+    "消一消",
+    "点击商品领优惠红包",
+    "发评价得金币",
+]
+
+
+def _match_keyword(text, keywords):
+    return next((keyword for keyword in keywords if keyword in text), None)
+
+
+def classify_coin_task(text):
+    for category, priority, keywords in COIN_TASK_SPECIAL_DO_RULES:
+        keyword = _match_keyword(text, keywords)
+        if keyword:
+            return {
+                "action": "do",
+                "category": category,
+                "priority": priority,
+                "reason": f"命中“{keyword}”",
+            }
+
+    for reason, keywords in COIN_TASK_SPECIAL_SKIP_RULES:
+        keyword = _match_keyword(text, keywords)
+        if keyword:
+            return {
+                "action": "skip",
+                "category": reason,
+                "priority": 999,
+                "reason": f"命中“{keyword}”",
+            }
+
+    for reason, keywords in COIN_TASK_SKIP_RULES:
+        keyword = _match_keyword(text, keywords)
+        if keyword:
+            return {
+                "action": "skip",
+                "category": reason,
+                "priority": 999,
+                "reason": f"命中“{keyword}”",
+            }
+
+    for category, priority, keywords in COIN_TASK_PRIORITY_RULES:
+        keyword = _match_keyword(text, keywords)
+        if keyword:
+            return {
+                "action": "do",
+                "category": category,
+                "priority": priority,
+                "reason": f"命中“{keyword}”",
+            }
+
+    return {
+        "action": "review",
+        "category": "未分类",
+        "priority": 900,
+        "reason": "没有命中 0 成本攻略规则",
+    }
+
+
+COIN_TASK_LABEL_RULES = [
+    ("costs_money", ["付款", "充值", "购买", "0.01元", "0.01 元", "充话费", "任意充值"]),
+    ("requires_order", ["下单", "购买商品", "任意下单", "下单即得", "下单得肥料", "买限时折扣好物", "买精选商品"]),
+    ("cross_app", ["蚂蚁庄园", "闲鱼币", "支付宝", "蚂蚁森林", "饿了么", "百度", "快手", "头条", "斗地主", "淘特", "夸克", "大众点评", "苏宁"]),
+    ("needs_auth", ["开通", "授权", "银行卡", "88VIP"]),
+    ("social_cost", ["邀请好友", "助力", "分享", "拉好友", "拉1人助力", "每拉"]),
+    ("pollutes_list", ["关注", "收藏", "加购"]),
+    ("uncertain_reward", ["抽奖", "抽免单卡", "砸蛋"]),
+    ("high_side_effect", ["点击商品领优惠红包", "发评价得金币"]),
+    ("conversion_inducement", ["闪购分百亿补贴", "补贴", "免单卡", "红包点外卖"]),
+    ("reward_explicit", ["+金币", "得金币", "领现金", "领红包", "领大额奖励", "捐爱心蛋"]),
+]
+
+
+def label_coin_task(text):
+    labels = {key: False for key, _ in COIN_TASK_LABEL_RULES}
+    matched = []
+    for key, keywords in COIN_TASK_LABEL_RULES:
+        hit = _match_keyword(text, keywords)
+        if hit:
+            labels[key] = True
+            matched.append(key)
+    labels["_matched"] = matched
+    return labels
+
+
+def check_chars_exist(text, chars=None):
+    return _match_keyword(text, chars or DEFAULT_SKIP_CHARS) is not None
+
+
+def get_current_app(d):
+    info = d.shell("dumpsys window | grep mCurrentFocus").output
+    match = re.search(r'mCurrentFocus=Window\{.*? u0 (.*?)/(.*?)\}', info)
+    if match:
+        package_name = match.group(1)
+        activity_name = match.group(2)
+        return package_name, activity_name
+
+    try:
+        current = d.app_current()
+        package_name = current.get("package")
+        activity_name = current.get("activity")
+        if package_name or activity_name:
+            return package_name, activity_name
+    except Exception:
+        pass
+    return None, None
+
+
+other_app = ["蚂蚁森林", "农场", "百度", "支付宝", "芝麻信用", "蚂蚁庄园", "闲鱼", "神奇海洋", "淘宝特价版", "点淘", "饿了么", "微博", "直播", "领肥料礼包", "福气提现金", "看小说", "菜鸟", "斗地主", "领肥料礼包"]
+
+
+def fish_not_click(text, chars=None):
+    if chars is None:
+        chars = ["发布一件新宝贝", "买到或卖出", "中国移动", "视频", "下单", "点淘", "一淘", "收藏", "购买"]
+    for char in chars:
+        if char in text:
+            return True
+    return False
+
+
+def find_button(image, btn_path, region=None):
+    template = cv2.imread(btn_path)
+    # 如果指定了区域，裁剪图像
+    if region is not None:
+        x, y, w_region, h_region = region
+        image = image[y:y + h_region, x:x + w_region]
+    # 转换为灰度图像
+    screenshot_gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    template_gray = cv2.cvtColor(template, cv2.COLOR_BGR2GRAY)
+    # 获取模板图像的宽度和高度
+    w, h = template_gray.shape[::-1]
+    # 使用模板匹配
+    res = cv2.matchTemplate(screenshot_gray, template_gray, cv2.TM_CCOEFF_NORMED)
+    threshold = 0.7
+    loc = np.where(res >= threshold)
+    for pt in zip(*loc[::-1]):
+        return pt
+    return None
+
+
+# 基于特征查找图片 threshold:匹配阈值（越高质量要求越高） scales:搜索的尺度范围 60%~140%
+def find_button_multiscale(screen_shot, template_path, scales=np.linspace(0.6, 1.4, 20), threshold=0.78, method=cv2.TM_CCOEFF_NORMED):
+    # 读取图片（建议都转成RGB或灰度，视情况）
+    template = cv2.imread(template_path)
+    if screen_shot is None or template is None:
+        return None, None, None
+    if isinstance(screen_shot, Image.Image):
+        screen_shot = cv2.cvtColor(np.array(screen_shot), cv2.COLOR_RGB2BGR)
+    elif isinstance(screen_shot, bytes):
+        img = Image.open(io.BytesIO(screen_shot))
+        screen_shot = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+    # 建议都转灰度（速度快很多，且很多按钮是单色/对比度强的）
+    large_gray = cv2.cvtColor(screen_shot, cv2.COLOR_BGR2GRAY)
+    tpl_gray = cv2.cvtColor(template, cv2.COLOR_BGR2GRAY)
+    h, w = tpl_gray.shape[:2]
+    best_val = -1
+    best_loc = None
+    best_scale = 1.0
+    best_rect = None
+    for scale in scales:
+        # 缩放模板（注意：也可以反过来缩放大图，但通常缩放小图更快）
+        resize_w = int(w * scale)
+        resize_h = int(h * scale)
+        if resize_w < 5 or resize_h < 5:
+            continue
+        resized_tpl = cv2.resize(tpl_gray, (resize_w, resize_h), interpolation=cv2.INTER_AREA if scale < 1 else cv2.INTER_CUBIC)
+        # 检查是否还能匹配（防止模板比大图还大）
+        if resized_tpl.shape[0] > large_gray.shape[0] or resized_tpl.shape[1] > large_gray.shape[1]:
+            continue
+        # 模板匹配
+        result = cv2.matchTemplate(large_gray, resized_tpl, method)
+        min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(result)
+        if method in [cv2.TM_SQDIFF, cv2.TM_SQDIFF_NORMED]:
+            val = min_val
+            loc = min_loc
+        else:
+            val = max_val
+            loc = max_loc
+        if val > best_val:  # 对于相关系数类方法，越大越好
+            best_val = val
+            best_loc = loc
+            best_scale = scale
+            best_rect = (loc[0], loc[1], resize_w, resize_h)
+    if best_val >= threshold:
+        x, y, bw, bh = best_rect
+        center_x = x + bw // 2
+        center_y = y + bh // 2
+        print(f"找到匹配！置信度: {best_val:.3f}")
+        print(f"左上角: ({x}, {y})")
+        print(f"中心点: ({center_x}, {center_y})")
+        print(f"按钮大小: {bw}×{bh}  (缩放比例 {best_scale:.2f})")
+        # 可视化（可选）
+        cv2.rectangle(screen_shot, (x, y), (x + bw, y + bh), (0, 255, 0), 2)
+        cv2.circle(screen_shot, (center_x, center_y), 5, (0, 0, 255), -1)
+        cv2.imwrite("result.jpg", screen_shot)
+        return (center_x, center_y), best_val, best_scale
+    else:
+        print(f"未找到足够匹配，最高置信度仅: {best_val:.3f}")
+        return None, best_val, None
+
+
+def find_text_position(image, text):
+    ocr = ddddocr.DdddOcr(show_ad=False)
+    ocr_result = ocr.classification(image)
+    # 将 OCR 结果按行解析
+    lines = ocr_result.split('\n')
+    # 遍历每一行，查找目标文本的位置
+    for line in lines:
+        if text in line:
+            # 获取文本的位置
+            start_index = line.find(text)
+            end_index = start_index + len(text)
+            return start_index, end_index
+    return None
+
+
+def check_can_open(d):
+    open_btn = d(className="android.widget.Button", textMatches=r"打开|允许|始终允许")
+    if open_btn.exists:
+        open_btn.click()
+        time.sleep(2)
+
+
+# 判断一个字符是否为中文字符
+def is_chinese(char):
+    return '\u4e00' <= char <= '\u9fff'
+
+
+def majority_chinese(text):
+    if not text:
+        return False
+    chinese_count = sum(1 for char in text if is_chinese(char))
+    return chinese_count > len(text) / 2
+
+
+search_keys = ["手机壳", "数据线", "收纳盒", "笔记本支架", "蓝牙耳机", "充电宝", "键盘", "鼠标垫"]
+
+
+def task_loop(d, back_func, origin_app=TB_APP, is_fish=False, duration=22):
+    check_can_open(d)
+    history_lst = d.xpath(
+        '(//android.widget.TextView[@text="历史搜索"]/following-sibling::android.widget.ListView)/android.view.View[1]')
+    if history_lst.exists:
+        print("查找到搜索关键字", history_lst)
+        history_lst.click()
+        time.sleep(2)
+    else:
+        search_view = d(className="android.view.View", text="搜索有福利")
+        if search_view.exists:
+            search_edit = d.xpath("//android.widget.EditText")
+            if search_edit.exists:
+                search_edit.set_text(random.choice(search_keys))
+                search_btn = d(className="android.widget.Button", text="搜索")
+                if search_btn.exists:
+                    search_btn.click()
+                    time.sleep(2)
+    screen_width, screen_height = d.window_size()
+    # check_count = 3
+    # while check_count >= 0:
+    #     if not func():
+    #         break
+    #     print(f"检查次数：{check_count}当前在任务页面，没有执行任务。。。")
+    #     check_count -= 1
+    #     if check_count <= 0:
+    #         return
+    #     time.sleep(2)
+    start_time = time.time()
+    consecutive_errors = 0
+    print("开始做任务。。。")
+    while True:
+        try:
+            package_name, _ = get_current_app(d)
+            bt_open = d(resourceId="android:id/button1", text="浏览器打开")
+            if bt_open.exists:
+                bt_close = d(resourceId="android:id/button2", text="取消")
+                if bt_close.exists:
+                    bt_close.click()
+                    time.sleep(2)
+                    break
+            if time.time() - start_time > duration:
+                break
+            if is_fish:
+                print("开始查找闲鱼商品")
+                time.sleep(4)
+                commodity_view1 = d.xpath("//android.widget.ListView/android.view.View[1]")
+                if commodity_view1.exists:
+                    print(f"存在commodity_view1，点击{commodity_view1.center()}")
+                    commodity_view1.click()
+                    time.sleep(18)
+                    break
+                commodity_view2 = d(className="android.view.View", resourceId="feedsContainer")
+                if commodity_view2.exists:
+                    print(f"存在commodity_view2，点击{(100, commodity_view2.center()[1])}")
+                    d.click(300, commodity_view2.center()[1])
+                    time.sleep(18)
+                    break
+            if package_name == origin_app or package_name == TMALL_APP:
+                if package_name == ALIPAY_APP:
+                    screen_image = d.screenshot(format='opencv')
+                    pt1, _, _ = find_button_multiscale(screen_image, "./img/alipay_get.png")
+                    if pt1:
+                        print("检测到立即领取的弹框，点击立即领取")
+                        d.click(int(pt1[0]) + 50, int(pt1[1]) + 20)
+                        time.sleep(1)
+                start_x = random.randint(screen_width // 6, screen_width // 2)
+                start_y = random.randint(screen_height // 2, screen_height - screen_height // 4)
+                end_x = random.randint(start_x - 100, start_x)
+                end_y = random.randint(200, start_y - 300)
+                swipe_time = random.uniform(0.4, 1) if end_y - start_y > 500 else random.uniform(0.2, 0.5)
+                print("模拟滑动", start_x, start_y, end_x, end_y, swipe_time)
+                d.swipe(start_x, start_y, end_x, end_y, swipe_time)
+                time.sleep(random.uniform(0.8, 2))
+            else:
+                time.sleep(5)
+            consecutive_errors = 0
+        except Exception as e:
+            consecutive_errors += 1
+            print(f"任务循环异常({consecutive_errors}/3): {e}")
+            if consecutive_errors >= 3:
+                print("任务循环连续异常过多，提前返回任务页")
+                break
+            time.sleep(5)
+    back_func()
+
+
+def back_to_video(d):
+    while True:
+        temp_package, temp_activity = get_current_app(d)
+        if temp_package is None or temp_activity is None or "Ext2ContainerActivity" in temp_activity:
+            continue
+        if temp_activity in VIDEO_ACTIVITY:
+            break
+        if FISH_APP not in temp_package:
+            start_app(d, FISH_APP)
+            continue
+        else:
+            d.press("back")
+            time.sleep(0.5)
+
+
+def in_video(d):
+    temp_package, temp_activity = get_current_app(d)
+    return temp_activity in VIDEO_ACTIVITY
+
+
+def video_task(d):
+    screen_width, screen_height = d.window_size()
+    while True:
+        print("开始任务循环")
+        time.sleep(4)
+        if not in_video(d):
+            break
+        speed_btn = d(className="android.widget.TextView", textMatches=r"我要加速|立即前往加速|我要减广告时长|我要立即领奖|立即打开")
+        if speed_btn.exists:
+            print(f"点击{speed_btn.get_text()}")
+            speed_btn.click()
+            time.sleep(2)
+            check_can_open(d)
+            time.sleep(18)
+            back_to_video(d)
+            continue
+        get_btn1 = d(className="android.widget.TextView", textMatches=r"奖励已领取|领取成功")
+        if get_btn1.exists:
+            print("点击奖励已领取")
+            jump_btn = d(className="android.widget.TextView", textContains="跳过")
+            if jump_btn.exists:
+                jump_btn.click()
+            else:
+                d.click(get_btn1.center()[0], get_btn1.bounds()[2] + 70)
+                time.sleep(2)
+            continue
+        get_btn2 = d(className="android.widget.TextView", text="恭喜获得奖励")
+        if get_btn2.exists:
+            print("恭喜获得奖励，点击关闭")
+            d.click(screen_width - 100, get_btn2.center()[1])
+            time.sleep(2)
+            continue
+        get_btn3 = d(className="android.widget.TextView", textMatches=r"立即(领取|抢购)")
+        if get_btn3.exists:
+            print("点击立即(领取|抢购)")
+            get_btn3[-1].click()
+            time.sleep(2)
+            check_can_open(d)
+            time.sleep(18)
+            back_to_video(d)
+            continue
+        screen_shot = d.screenshot(format='opencv')
+        pt1, _, _ = find_button_multiscale(screen_shot, "./img/video_get.png", threshold=0.7)
+        if pt1:
+            d.click(int(pt1[0]), int(pt1[1]))
+            time.sleep(2)
+            check_can_open(d)
+            time.sleep(18)
+            back_to_video(d)
+            continue
+        d.swipe_ext(u2.Direction.FORWARD)
+
+
+def close_xy_dialog(d):
+    dialog_view1 = d.xpath(
+        '//android.webkit.WebView[@text="闲鱼币首页"]/android.view.View/android.view.View[2]//android.widget.Image[1]')
+    if dialog_view1.exists:
+        dialog_view1.click()
+        time.sleep(2)
+
+
+def get_connected_devices():
+    """通过ADB获取所有连接的安卓设备序列号"""
+    try:
+        # 执行adb命令获取设备列表
+        result = subprocess.run(
+            ["adb", "devices"],
+            capture_output=True,
+            text=True,
+            check=True
+        )
+
+        # 解析输出，提取设备序列号
+        output = result.stdout
+        devices = []
+        for line in output.splitlines():
+            # 跳过标题行和空行
+            if line.strip() == "" or line.startswith("List of devices attached"):
+                continue
+            match = re.match(r"^([^\s]+)\s+device$", line)
+            if match:
+                devices.append(match.group(1))
+        return devices
+    except subprocess.CalledProcessError:
+        print("执行ADB命令失败，请确保ADB已正确安装并添加到环境变量")
+        return []
+    except FileNotFoundError:
+        print("未找到ADB命令，请确保ADB已正确安装并添加到环境变量")
+        return []
+
+
+# 从已连接的设备中，返回用户选中的设备序列号
+def select_device():
+    # 获取所有连接的设备
+    devices = get_connected_devices()
+
+    if not devices:
+        raise Exception("未检测到任何连接的安卓设备")
+
+        # 根据设备数量进行处理
+    if len(devices) == 1:
+        # 只有一个设备，直接返回
+        return devices[0]
+    else:
+        # 多个设备，让用户选择
+        print("当前连接多个设备，请输入要执行的设备序号：")
+        for i, device in enumerate(devices, 1):
+            print(f"  {i}: {device}")
+
+        # 获取用户输入并验证
+        while True:
+            try:
+                choice = input("请输入设备序号：")
+                index = int(choice) - 1  # 转换为列表索引
+
+                if 0 <= index < len(devices):
+                    # 选中的设备
+                    return devices[index]
+                else:
+                    print(f"输入错误，请重新输入序号（1-{len(devices)}）")
+            except ValueError:
+                print(f"输入错误，请重新输入序号（1-{len(devices)}）")
+
+
+def start_app(d, package_name, init=False):
+    """根据包名启动应用，支持特定应用的activity配置
+    init参数控制启动模式：
+    - True: 初始化启动，使用stop=True, use_monkey=True
+    - False: 普通启动，使用stop=False, use_monkey=False
+    默认不使用activity启动，如果失败再尝试使用activity
+    activity启动时不使用use_monkey参数
+    启动后验证是否成功"""
+    # 根据init参数设置stop和use_monkey
+    stop = init
+    use_monkey = init
+    
+    # 获取配置的activity
+    activity = APP_START_CONFIG.get(package_name)
+    try_count = 3
+    try:
+        # 优先不使用activity启动
+        while try_count > 0:
+            print(f"启动应用: {package_name}, stop: {stop}, use_monkey: {use_monkey}, 不使用activity")
+            d.app_start(package_name, stop=stop, use_monkey=use_monkey)
+            time.sleep(5 if stop else 2)
+            cancel_btn = d(className="android.widget.FrameLayout", resourceId="com.taobao.taobao:id/uik_fl_textview_container_2")
+            if cancel_btn.exists:
+                cancel_btn.click()
+                time.sleep(2)
+            # 验证应用是否启动成功
+            current_package, _ = get_current_app(d)
+            if current_package == package_name:
+                print(f"应用 {package_name} 启动成功")
+                return
+            else:
+                print(f"应用 {package_name} 未成功启动，当前应用: {current_package}，尝试后退")
+                d.press("back")
+                time.sleep(1)
+            try_count -= 1
+    except Exception as e:
+        print(f"不使用activity启动失败: {e}")
+        
+    # 如果失败且有配置activity，则尝试使用activity启动
+    if activity:
+        try:
+            print(f"使用activity启动应用: {package_name}, activity: {activity}, stop: {stop}")
+            d.app_start(package_name=package_name, activity=activity, stop=stop)
+            time.sleep(2)
+            # 验证应用是否启动成功
+            current_package, _ = get_current_app(d)
+            if current_package == package_name:
+                print(f"应用 {package_name} 启动成功")
+                return
+            else:
+                print(f"应用 {package_name} 未成功启动，当前应用: {current_package}")
+        except Exception as e:
+            print(f"使用activity启动也失败: {e}")
+    raise RuntimeError(f"无法启动应用: {package_name}")
+
+
+def check_verify(d, max_attempts=5):
+    verify_view = d(className="android.webkit.WebView", text="验证码拦截")
+    if verify_view.exists:
+        for attempt in range(1, max_attempts + 1):
+            print("存在验证码的情况")
+            d.shell("input swipe 150 1700 1180 1700 500")
+            time.sleep(3)
+            verify_view = d(className="android.webkit.WebView", text="验证码拦截")
+            if verify_view.exists:
+                d.click(500, 1700)
+                time.sleep(3)
+            else:
+                print("验证码滑动成功")
+                return
+        raise TimeoutError(f"验证码处理失败，已尝试 {max_attempts} 次")
+
+
+def print_error():
+    exc_type, exc_value, exc_traceback = sys.exc_info()
+    print("=" * 10)
+    print(f"错误类型: {exc_type}")
+    print(f"错误信息: {exc_value}")
+    print(f"错误行号: {exc_traceback.tb_lineno}")
+    print("=" * 10)
+    tb_info = traceback.extract_tb(exc_traceback)
+    for frame in tb_info:
+        print(f"文件: {frame.filename}, 行号: {frame.lineno}, 函数: {frame.name}, 代码: {frame.line}")
+    print("=" * 10)
+
+# find_button2(cv2.imread("screenshot.png"), "./img/alipay_get.png")
+
+
+# ── 页面类型常量 ──
+PAGE_COIN_TASK_LIST = "coin_task_list"      # 淘金币任务列表（有"赚金币抵钱"/"今日累计奖励"）
+PAGE_COIN_MAIN = "coin_main"                # 淘金币主页（WebView="淘金币首页"但不在任务列表）
+PAGE_FARM = "farm"                          # 芭芭农场页面
+PAGE_EVENT = "event"                        # 活动会场页（618/闪购/补贴等内嵌 WebView）
+PAGE_TAOBAO_NATIVE = "taobao_native"        # 淘宝原生页（商品详情/搜索结果等）
+PAGE_CROSS_APP = "cross_app"                # 外部 App（支付宝/闲鱼/其他）
+PAGE_OTHER = "other"                        # 无法识别
+
+# 跨 App package → 友好名称
+_CROSS_APP_PACKAGES = {
+    ALIPAY_APP: "支付宝",
+    FISH_APP: "闲鱼",
+    TMALL_APP: "天猫",
+    "com.eg.android.AlipayGphone": "支付宝",
+}
+
+# 芭芭农场页面特征
+_FARM_INDICATORS = ["芭芭农场", "农场", "施肥", "浇水", "种果树", "领取肥料"]
+
+# 活动页特征（淘金币任务之外的 WebView 活动页）
+_EVENT_INDICATORS = ["618", "双11", "闪购", "补贴", "百亿", "会场", "活动"]
+
+
+def detect_page_type(d):
+    """识别当前页面类型。
+
+    识别优先级（从高到低）：
+      1. 跨 App 页面（package 不是淘宝/天猫）
+      2. 淘金币任务列表（WebView=淘金币首页 + 任务列表特征）
+      3. 淘金币主页（WebView=淘金币首页，但不在任务列表）
+      4. 芭芭农场（WebView 含农场特征）
+      5. 活动会场页（WebView 含活动特征）
+      6. 淘宝内嵌 WebView（其他 WebView 页面）
+      7. 淘宝原生页（非 WebView）
+      8. other
+
+    返回值：上述 PAGE_* 常量之一。
+    """
+    package, activity = get_current_app(d)
+    if package is None:
+        return PAGE_OTHER
+
+    # ── 优先级 1：跨 App ──
+    if TB_APP not in package and TMALL_APP not in package:
+        return PAGE_CROSS_APP
+
+    # ── 以下是淘宝/天猫内部 ──
+
+    # ── 优先级 2 & 3：淘金币页面 ──
+    try:
+        coin_webview = d(className="android.webkit.WebView", text="淘金币首页")
+        if coin_webview.exists:
+            # 进一步区分：任务列表 vs 主页
+            earn1 = d(textContains="赚金币抵钱")
+            earn2 = d(textContains="今日累计奖励")
+            if earn1.exists or earn2.exists:
+                return PAGE_COIN_TASK_LIST
+            return PAGE_COIN_MAIN
+    except Exception:
+        pass
+
+    # ── 优先级 4：芭芭农场 ──
+    try:
+        for indicator in _FARM_INDICATORS:
+            el = d(textContains=indicator)
+            if el.exists:
+                return PAGE_FARM
+    except Exception:
+        pass
+
+    # ── 优先级 5：活动会场 ──
+    try:
+        wv = d(className="android.webkit.WebView")
+        if wv.exists:
+            wv_text = wv.get_text() or ""
+            # 检查 WebView 标题或页面内文本
+            for indicator in _EVENT_INDICATORS:
+                if indicator in wv_text:
+                    return PAGE_EVENT
+            # 也检查页面内普通文本
+            for indicator in _EVENT_INDICATORS:
+                el = d(textContains=indicator)
+                if el.exists:
+                    return PAGE_EVENT
+            # 有 WebView 但不是上述类型 → 普通 WebView 页
+            return PAGE_EVENT
+    except Exception:
+        pass
+
+    # ── 优先级 6：淘宝原生页 ──
+    return PAGE_TAOBAO_NATIVE
+
+
+def get_page_type_label(page_type: str) -> str:
+    """返回页面类型的中文描述，方便日志输出。"""
+    labels = {
+        PAGE_COIN_TASK_LIST: "淘金币任务列表",
+        PAGE_COIN_MAIN: "淘金币主页",
+        PAGE_FARM: "芭芭农场",
+        PAGE_EVENT: "活动会场",
+        PAGE_TAOBAO_NATIVE: "淘宝原生页",
+        PAGE_CROSS_APP: "外部App",
+        PAGE_OTHER: "未知页面",
+    }
+    return labels.get(page_type, page_type)
+
+
+def is_taobao_coin_page(d) -> bool:
+    """判断当前是否在淘金币相关页面（主页或任务列表）。"""
+    page = detect_page_type(d)
+    return page in (PAGE_COIN_TASK_LIST, PAGE_COIN_MAIN)
+
+
+def is_cross_app(d) -> bool:
+    """判断当前是否在外部 App 中。"""
+    return detect_page_type(d) == PAGE_CROSS_APP
