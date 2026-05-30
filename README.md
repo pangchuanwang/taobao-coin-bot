@@ -1,125 +1,156 @@
-# 淘宝淘金币自动任务
+# taobao-coin-bot
 
-使用 uiautomator2 自动完成淘宝淘金币日常任务，支持任务自动发现、优先级排序、执行验证和每日报告。
+English | [简体中文](README.zh-CN.md)
 
-## 环境要求
+An Android UI automation tool for learning and research purposes, built with Python and uiautomator2. Automates repetitive daily tasks in the Taobao app through ADB device control, with task discovery, priority scoring, execution verification, and daily reporting.
+
+> **Disclaimer:** This project is for personal learning and research on Android UI automation. Users are responsible for complying with all applicable platform terms of service. This is not a commercial product and makes no guarantees about outcomes.
+
+---
+
+## Overview
+
+taobao-coin-bot connects to an Android phone via USB/ADB, launches the Taobao app, navigates to the daily rewards page, and automates the workflow of discovering available tasks, scoring them by efficiency, executing them in priority order, and verifying completion.
+
+The tool demonstrates practical Android UI automation techniques including element finding, gesture simulation, OCR, template matching, cross-app navigation, and CAPTCHA handling.
+
+## Features
+
+### Task Discovery
+- Scans the task page by scrolling, extracting task names, subtitles, rewards, and progress from Android UI elements
+- Maintains a persistent task catalog tracking first-seen and last-seen dates
+- Detects new and removed tasks daily; flags unknown tasks for later analysis
+
+### Priority Scoring
+- Each task scored by `reward / estimated_seconds`
+- Tasks requiring payment, orders, social invites, or authorization are automatically skipped
+- Historical execution data (duration, reward, success rate) refines future estimates
+
+### Task Handlers
+- **Browse**: Timed scroll through product/event pages
+- **Claim**: Sign-in and reward collection
+- **Search Browse**: Wait for search results, scroll, return
+- **Deep Browse**: Product detail page immersion with slow scroll
+- **Event Browse**: Promotional event pages (scroll only, no purchases)
+- **Quiz**: Detect answer options, click one, claim reward
+- **Cross-App**: Navigate to Alipay/Xianyu for partner tasks, then recover back to Taobao
+
+### Execution Verification
+- Re-scans the task list after each execution to confirm progress increased
+- Records success/failure samples for continuous learning
+
+### Daily Reports
+- Generates JSON + text summary reports per run
+- Tracks: completed, skipped, failed, new tasks; total reward; elapsed time
+
+### Cross-App Navigation
+- 3-phase recovery strategy for returning from external apps (Alipay, Xianyu, Tmall)
+- Phase 1: press back / pull Taobao to foreground
+- Phase 2: restart Taobao entirely
+- Phase 3: fallback to task page
+
+### CAPTCHA Handling
+- Detects slide-to-verify CAPTCHAs and performs automated slide gestures
+
+## Tech Stack
+
+- **Language:** Python 3.10+
+- **Android Automation:** uiautomator2 (3.5.0) — drives phone UI via ADB
+- **ADB:** adbutils (bundled with uiautomator2)
+- **OCR:** ddddocr (1.6.1) — Chinese text recognition on screenshots
+- **Image Recognition:** OpenCV (4.13.0.92) — multi-scale template matching for button detection
+- **License:** Apache 2.0
+
+## Project Structure
+
+```
+淘金币任务.py            — Main script: task discovery, scheduling, execution, verification
+coin_task_planner.py     — Task planner: catalog management, stats learning, priority sorting, reports
+coin_task_handlers.py    — Task handlers: browse, claim, quiz, cross-app, etc.
+utils.py                 — Utilities: device connection, task classification rules, UI operations, OCR
+run_daily_taobao.py      — Daily run entry point
+run_daily_taobao.ps1     — PowerShell runner (auto-configures ADB path, logging)
+setup.ps1                — One-click setup script (venv, dependencies, ADB check)
+requirements.txt         — Python dependencies
+```
+
+## Getting Started
+
+### Prerequisites
 
 - Windows 10/11
 - Python 3.10+
-- 安卓手机 + USB 数据线
+- Android phone with USB debugging enabled
+- USB data cable
 
-## 快速开始
+### Setup
 
-### 1. 开启手机 USB 调试
-
-1. 手机进入 **设置 → 关于手机**，连续点击"版本号" 7 次，开启开发者模式
-2. 进入 **设置 → 开发者选项**，打开 **USB 调试**
-3. 用数据线连接电脑，手机弹窗选择 **允许 USB 调试**
-
-### 2. 安装依赖
-
-打开 PowerShell，进入项目目录，执行：
+1. Enable USB debugging on your phone: Settings → About Phone → tap Build Number 7 times → Developer Options → USB Debugging
+2. Connect phone via USB and authorize the debugging prompt
+3. Run setup:
 
 ```powershell
-cd taobao
 .\setup.ps1
 ```
 
-脚本会自动：
-- 创建 Python 虚拟环境（`.venv`）
-- 安装所有依赖
-- 检查 ADB 是否可用（项目自带一份，无需单独安装）
+This creates a virtual environment, installs dependencies, and checks for ADB.
 
-### 3. 首次连接手机
-
-确认电脑识别到手机：
+4. Verify device connection:
 
 ```powershell
 .\.venv\Lib\site-packages\adbutils\binaries\adb.exe devices
 ```
 
-看到设备序列号（如 `497e26a2  device`）即为成功。然后初始化 uiautomator2：
+5. Initialize uiautomator2 on the phone:
 
 ```powershell
 .\.venv\Scripts\python.exe -m uiautomator2 init
 ```
 
-### 4. 每日运行
+### Daily Run
 
-确保手机已亮屏解锁、淘宝已登录，然后执行：
+Ensure the phone is unlocked and Taobao is logged in, then:
 
 ```powershell
 .\run_daily_taobao.ps1
 ```
 
-脚本会自动打开淘宝、进入淘金币任务页、逐个完成任务，完成后生成运行报告。
+Logs are saved to `logs/`.
 
-## 运行输出
+## Usage
 
-### 日志
+The tool automatically:
+1. Opens Taobao and navigates to the coin task page
+2. Scans all available tasks
+3. Scores and prioritizes them
+4. Executes tasks in priority order
+5. Verifies each task's completion
+6. Generates a daily report
 
-运行日志保存在 `logs\daily-run-{yyyyMMdd-HHmmss}.log`。
+**Important:** Do not interact with the phone during execution — the tool controls the UI via ADB.
 
-### 每日报告
+## Highlights
 
-每次运行结束后自动生成两份报告：
+- **Decorator-based handler registry**: New task types can be added by simply decorating a function
+- **Learning from history**: Task outcomes (duration, reward, success) are persisted and used to improve future estimates
+- **Multi-signal classification**: Tasks are classified by 11 priority categories, 5 skip categories, and 10 label types
+- **Robust cross-app recovery**: 3-phase strategy with timeout deadlines for returning from external apps
+- **Human-like behavior**: Randomized swipe coordinates, durations, and wait intervals to reduce detection risk
+- **Comprehensive reporting**: Structured JSON + human-readable text reports for each run
 
-| 文件 | 说明 |
-|------|------|
-| `logs\daily-report-{yyyyMMdd}.json` | 结构化数据，可供程序读取 |
-| `logs\daily-report-{yyyyMMdd}.txt` | 人可读的文本摘要 |
+## Roadmap
 
-报告包含以下字段：
+- Support more task types as Taobao updates its UI
+- Add scheduling support (e.g., daily cron)
+- Improve quiz answer accuracy
+- Add web dashboard for report visualization
+- Cross-platform support (macOS/Linux)
 
-| 字段 | 说明 |
-|------|------|
-| identified_count | 本次识别到的任务总数 |
-| completed_count / completed_tasks | 已验证完成的任务（名称、分类、奖励、耗时） |
-| skipped_count / skipped_tasks | 跳过的任务（含跳过原因） |
-| new_count / new_tasks | 今日新发现的任务 |
-| failed_count / failed_tasks | 执行后未通过验证的任务 |
-| total_reward | 已验证任务的总金币收益 |
-| elapsed_seconds | 总耗时 |
+## Author
 
-### 任务学习数据
+Chuanwang Pang
+GitHub: [github.com/pangchuanwang](https://github.com/pangchuanwang)
 
-- `logs\coin_task_stats.json` — 任务历史执行样本（耗时、奖励、成功率），用于优化后续执行效率
-- `logs\coin_task_catalog.json` — 任务目录，记录所有见过的任务及首次/末次出现时间
+## License
 
-## 项目结构
-
-```
-├── 淘金币任务.py          # 主脚本，负责任务发现、调度、执行、验证
-├── coin_task_planner.py    # 任务规划器：目录管理、统计学习、优先级排序、报告生成
-├── coin_task_handlers.py   # 任务处理器：按任务类型（浏览、签到、答题等）执行具体操作
-├── utils.py                # 工具函数：设备连接、任务分类规则、UI 操作、验证码识别
-├── run_daily_taobao.py     # 日常运行入口
-├── run_daily_taobao.ps1    # PowerShell 运行脚本（自动配置 ADB 路径、记录日志）
-├── setup.ps1               # 一键安装脚本
-├── requirements.txt        # Python 依赖
-└── logs/                   # 运行日志、报告、统计数据
-```
-
-## 常见问题
-
-**Q: 提示"禁止运行脚本"**
-
-```powershell
-Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned
-```
-
-输入 `Y` 确认后重新运行。
-
-**Q: 提示"未检测到任何连接的安卓设备"**
-
-- 检查数据线是否支持数据传输（部分线只能充电）
-- 手机是否弹出了 USB 调试授权窗口
-- 运行 `adb devices` 确认设备状态为 `device`（不是 `unauthorized`）
-
-**Q: 任务突然不生效了**
-
-淘宝页面经常改版，如果按钮文案或页面结构变化，需要更新脚本中对应的定位规则。
-
-**Q: 运行中可以操作手机吗**
-
-不可以。脚本通过 ADB 控制手机界面，手动操作会导致脚本失控。建议运行期间将手机放在一旁。
+Apache 2.0
